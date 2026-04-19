@@ -1,0 +1,9 @@
+In Arduino preferences.txt:
+boardsmanager.additional.urls=https://dl.espressif.com/dl/package_esp32_index.json
+
+test_client.ino:
+    Device: ESP32 Dev Module
+
+
+camera_server.ino:
+    Device: AI Thinker ESP32-CAM
