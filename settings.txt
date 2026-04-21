@@ -1,5 +1,6 @@
 In Arduino preferences.txt:
-boardsmanager.additional.urls=https://dl.espressif.com/dl/package_esp32_index.json
+https://dl.espressif.com/dl/package_esp32_index.json
+https://espressif.github.io/arduino-esp32/package_esp32_index.json
 
 test_client.ino:
     Device: ESP32 Dev Module
