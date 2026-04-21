@@ -5,6 +5,7 @@
 # https://www.youtube.com/watch?v=npJsmbFZiMg
 
 # Threaded Frame Buffering OpenCV
+# Nick Keuning (2024, June 11)
 # https://spin.atomicobject.com/frame-buffering-opencv/
 
 # Non-blocking HTTP POST Request
@@ -20,23 +21,38 @@ import threading
 import queue
 import time
 
-ESP32_URL = "http://10.49.26.204:1145/update"
-ESP32_CAM_URL = "http://10.49.26.31:81/stream"
-ESP32_CAM_IP = "http://10.49.26.31"
+# Note: we need to find a way in order to ensure that the
+# IP addresses of the ESP32_CAM and ESP32 remain static, as to
+# not have to go through the trouble of setting up the links
+# every time a new session is started
+ESP32_URL = "http://10.42.33.204:1145/update"
+ESP32_CAM_URL = "http://10.42.33.31:81/stream"
+ESP32_CAM_IP = "http://10.49.33.31"
 
 # framesize: 4=VGA(640x480), 5=SVGA, 6=XGA(1024x768), 8=SXGA, 9=UXGA.
+# We will utilize XGA for this project -- balance of speed and image quality
 try:
     requests.get(f"{ESP32_CAM_IP}/control?var=framesize&val=6", timeout=2)
     print("Resolution set")
 except Exception as e:
     print(f"Could not set resolution: {e}")
 
-model = YOLO('yolo11n.pt')
+model = YOLO('yolo11n.pt') # We will use a pretrained model (ultralytics YOLOv11)
 
 # ===========================
 # Helpers
 # ===========================
 # -- Bufferless CV Capture --
+# This was a neat solution by Keuning (2024)!
+# The "view" of the feed, seen from the stream, lagged
+# far behind real-time.
+#
+# This fix decouples the reading of frames from the stream
+# from the actual logical feed via the usage of threads!
+#
+# _reader() is in charge of getting frames from the stream
+# read() is in charge of the control logic
+# ---------------------------
 class FrameGrabber:
     def __init__(self, src):
         self.cap = cv2.VideoCapture(src)
@@ -48,6 +64,7 @@ class FrameGrabber:
         self.thread.start()
 
     # read frames as asap
+    # keep only the most recent capture instead of the whole stream buffer
     def _reader(self):
         while self.running:
             ret, frame = self.cap.read()
@@ -69,6 +86,19 @@ class FrameGrabber:
         self.thread.join(timeout=1)
 
 # -- Non-blocking HTTP POST --
+# The typical HTTP request is a blocking request.
+# When we send a request to a remote server (e.g. HTTP POST),
+# execution is paused and we wait for the remote server to send a
+# response before we are able to proceed to other actions.
+#
+# I fear that there may be a risk of the
+# HTTP requests blocking the other functions in our
+# inference server.
+#
+# In order to remedy this, we enforce non-blocking requests
+# -- fire-and-forget -- in order to ensure that code exeuction
+# is properly continued.
+# ----------------------------
 post_queue = queue.Queue(maxsize=2)
 
 def poster():
@@ -77,10 +107,13 @@ def poster():
         if payload is None:
             break
         try:
+            # try to send
             requests.post(ESP32_URL, data=payload, timeout=0.5)
         except Exception as e:
+            # if failed (timeout reached), just display an error message
             print(f"POST failed: {e}")
 
+# We double down on using threads haha
 threading.Thread(target=poster, daemon=True).start()
 
 # ===========================
@@ -134,6 +167,7 @@ try:
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 finally:
+    # Proper teardown of threads
     if grabber is not None:
         grabber.release()
     post_queue.put(None)
