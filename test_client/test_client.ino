@@ -1,3 +1,6 @@
+// This is a sample client, based off CS 145 Lab Exercises
+// We display the results from the inference server here!
+
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WebServer.h>
