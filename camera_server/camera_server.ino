@@ -186,6 +186,14 @@ void setup() {
   // ===========================
   // Display IP on OLED
   // ===========================
+  // In order to correctly display text on the OLED display,
+  // the following steps need to be done:
+  // 1) Clear buffer
+  // 2) Configure font settings (size, color)
+  // 3) Set cursor -- position on OLED screen
+  // 4) Send to buffer via println()
+  // 5) Display buffer info via display()
+  // ===========================
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
@@ -202,6 +210,14 @@ void setup() {
 void loop() {
   // ===========================
   // Toggle flash
+  // ===========================
+  // In order to toggle flash via a hardware button,
+  // we need to register the button press via
+  // capturing the falling edge in order to properly
+  // toggle things.
+  // 
+  // The code here can be used repurposed for other digital 
+  // inputs as well (e.g. signals from other devices)
   // ===========================
   static bool lastButtonState = HIGH;
   bool currentButtonState = digitalRead(BUTTON_PIN);
