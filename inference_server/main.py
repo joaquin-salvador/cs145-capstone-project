@@ -1,19 +1,28 @@
-# ===========================
+# ReSiklo: Inference Server
+#
+# Consumes feed produced by camera_server, runs YOLO
+# continuously on each frame, and pushes bottle-presence
+# signals to trashcan_module via HTTP /update endpoint.
+#
+# Recycling session is only started when user presses
+# the RECYCLE button on the orchestrator. The trashcan_module
+# stays in WAITING_FOR_BOTTLE until /update turns bottleVisible
+# to 'true'.
+#
+# Signals:
+#   label   = BOTTLE | NO_OBJECT
+#   led     = BOTTLE_DETECTED | NO_BOTTLE
+#
 # References
-# ===========================
-# ESP32-CAM & YOLO - Computer Vision
-# https://www.youtube.com/watch?v=npJsmbFZiMg
+#   - YOLOv8 for real-time waste classification (Rastari et al., 2024):
+#     https://ieeexplore.ieee.org/document/10730703
+#   - Bufferless OpenCV capture pattern (Keuning, 2024):
+#     https://spin.atomicobject.com/frame-buffering-opencv/
+#   - Non-blocking HTTP POST pattern:
+#     https://www.w3tutorials.net/blog/sending-a-non-blocking-http-post-request/
+#   - Ultralytics YOLO API:
+#     https://docs.ultralytics.com/
 
-# Threaded Frame Buffering OpenCV
-# Nick Keuning (2024, June 11)
-# https://spin.atomicobject.com/frame-buffering-opencv/
-
-# Non-blocking HTTP POST Request
-# https://www.w3tutorials.net/blog/sending-a-non-blocking-http-post-request/
-
-# ===========================
-# Setup
-# ===========================
 from ultralytics import YOLO
 import cv2
 import requests
@@ -21,28 +30,21 @@ import threading
 import queue
 import time
 
-# Note: we need to find a way in order to ensure that the
-# IP addresses of the ESP32_CAM and ESP32 remain static, as to
-# not have to go through the trouble of setting up the links
-# every time a new session is started
-ESP32_URL = "http://10.42.33.204:1145/update"
-ESP32_CAM_URL = "http://10.42.33.31:81/stream"
-ESP32_CAM_IP = "http://10.49.33.31"
+# Network Configuration
+ESP32_CAM_HOST   = "resiklo-cam.local"
+ESP32_CAM_STREAM = f"http://{ESP32_CAM_HOST}:81/stream"
+ESP32_CAM_CTRL   = f"http://{ESP32_CAM_HOST}/control"
 
-# framesize: 4=VGA(640x480), 5=SVGA, 6=XGA(1024x768), 8=SXGA, 9=UXGA.
-# We will utilize XGA for this project -- balance of speed and image quality
-try:
-    requests.get(f"{ESP32_CAM_IP}/control?var=framesize&val=6", timeout=2)
-    print("Resolution set")
-except Exception as e:
-    print(f"Could not set resolution: {e}")
+TRASHCAN_HOST    = "http://resiklo-bin.local:1145"
+TRASHCAN_UPDATE  = f"{TRASHCAN_HOST}/update"
 
-model = YOLO('yolo11n.pt') # We will use a pretrained model (ultralytics YOLOv11)
+# Detection Tuning
+BOTTLE_CLASS_ID = 39 # 'bottle' in COCO
+BOTTLE_DETECTION_THRESHOLD = 0.30
 
-# ===========================
-# Helpers
-# ===========================
-# -- Bufferless CV Capture --
+model = YOLO('yolo11n.pt') # Pretrained Ultralytics YOLOv11
+
+# Bufferless CV Capture
 # This was a neat solution by Keuning (2024)!
 # The "view" of the feed, seen from the stream, lagged
 # far behind real-time.
@@ -55,22 +57,31 @@ model = YOLO('yolo11n.pt') # We will use a pretrained model (ultralytics YOLOv11
 # ---------------------------
 class FrameGrabber:
     def __init__(self, src):
+        self.src = src
         self.cap = cv2.VideoCapture(src)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Keep only 1 frame buffered
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.ret, self.frame = self.cap.read()
         self.lock = threading.Lock()
         self.running = True
         self.thread = threading.Thread(target=self._reader, daemon=True)
         self.thread.start()
 
-    # read frames as asap
-    # keep only the most recent capture instead of the whole stream buffer
     def _reader(self):
+        fail_count = 0
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
+                fail_count += 1
+                if fail_count > 30:
+                    print("[STREAM] Connection lost, reconnecting...")
+                    self.cap.release()
+                    time.sleep(1)
+                    self.cap = cv2.VideoCapture(self.src)
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    fail_count = 0
                 time.sleep(0.01)
                 continue
+            fail_count = 0
             with self.lock:
                 self.ret, self.frame = ret, frame
 
@@ -85,21 +96,9 @@ class FrameGrabber:
         self.cap.release()
         self.thread.join(timeout=1)
 
-# -- Non-blocking HTTP POST --
-# The typical HTTP request is a blocking request.
-# When we send a request to a remote server (e.g. HTTP POST),
-# execution is paused and we wait for the remote server to send a
-# response before we are able to proceed to other actions.
-#
-# I fear that there may be a risk of the
-# HTTP requests blocking the other functions in our
-# inference server.
-#
-# In order to remedy this, we enforce non-blocking requests
-# -- fire-and-forget -- in order to ensure that code exeuction
-# is properly continued.
-# ----------------------------
-post_queue = queue.Queue(maxsize=2)
+
+# Non-blocking HTTP POST
+post_queue = queue.Queue(maxsize=8)
 
 def poster():
     while True:
@@ -107,69 +106,77 @@ def poster():
         if payload is None:
             break
         try:
-            # try to send
-            requests.post(ESP32_URL, data=payload, timeout=0.5)
+            response = requests.post(payload["url"], data=payload["data"], timeout=2.0)
+            if response.status_code < 400:
+                print(f"[POST OK] {payload['url'].split('/')[-1]}")
+            else:
+                print(f"[POST ERROR] Status {response.status_code}")
+        except requests.exceptions.Timeout:
+            print(f"[POST TIMEOUT] {payload['url'].split('/')[-1]} - ESP32 busy")
+        except requests.exceptions.ConnectionError as e:
+            print(f"[POST CONNECTION ERROR] {str(e)}")
         except Exception as e:
-            # if failed (timeout reached), just display an error message
-            print(f"POST failed: {e}")
+            print(f"[POST ERROR] {str(e)}")
 
-# We double down on using threads haha
-threading.Thread(target=poster, daemon=True).start()
-
-# ===========================
 # Main loop
-# ===========================
 grabber = None
-last_state = None  # (label, led)
-                   # Only POST when this changes
+last_state = None # (label, led) -- only POST /update when it changes
 
 poster_thread = threading.Thread(target=poster, daemon=True)
 poster_thread.start()
 
 try:
-    grabber = FrameGrabber(ESP32_CAM_URL)
-    cv2.namedWindow('frame', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('frame', 1280, 720)
+    grabber = FrameGrabber(ESP32_CAM_STREAM)
+    cv2.namedWindow("frame", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("frame", 1280, 720)
 
     while True:
         ret, frame = grabber.read()
         if not ret or frame is None:
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
             continue
 
         detections = model(frame, imgsz=416, verbose=False)
 
-        label = "Nothing detected"
-        led = "..."
+        label = "NO_OBJECT"
+        led   = "NO_BOTTLE"
 
         for box in detections[0].boxes:
             cls_id = int(box.cls[0])
-            if cls_id == 39:  # bottle in COCO
+            if cls_id == BOTTLE_CLASS_ID:
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = box.xyxy[0]
-                if conf > 0.3:
-                    led = "DINGDINGDING"
-                label = f"Bottle ({conf:.2f})"
+                if conf >= BOTTLE_DETECTION_THRESHOLD:
+                    led   = "BOTTLE_DETECTED"
+                    label = "BOTTLE"
+
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 3)
-                cv2.putText(frame, f'Bottle {conf:.2f}', (int(x1), int(y1) - 10),
+                cv2.putText(frame, f"Bottle {conf:.2f}", (int(x1), int(y1) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
+        # Post status update only on a change in (label, led).
         state = (label, led)
         if state != last_state:
             try:
-                post_queue.put_nowait({"label": label, "led": led})
+                post_queue.put_nowait({
+                    "url": TRASHCAN_UPDATE,
+                    "data": {"label": label, "led": led},
+                })
+                print(f"[UPDATE] {label}")
             except queue.Full:
                 pass
+            except Exception as e:
+                print(f"[QUEUE ERROR] {str(e)}")
             last_state = state
 
-        cv2.imshow('frame', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        cv2.imshow("frame", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 finally:
-    # Proper teardown of threads
     if grabber is not None:
         grabber.release()
     post_queue.put(None)
     poster_thread.join(timeout=1)
     cv2.destroyAllWindows()
+
