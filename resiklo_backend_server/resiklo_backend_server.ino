@@ -26,37 +26,35 @@
 const char *ssid = "netnetnet";
 const char *password = "hRkh777r";
 
-// Intermediary PythonAnywhere URL
-const char* serverUrl = "http://resiklo.pythonanywhere.com";
-
-// Local backend URLs (Flask servers in backend/)
-const char* MOSIP_URL   = "http://192.168.1.42:5001";
-const char* REWARDS_URL = "http://192.168.1.42:5000";
+// Local backend URLs
+const char* BACKEND_MDNS_HOST = "resiklo-host";
+const int   MOSIP_PORT        = 1714;
+const int   REWARDS_PORT      = 1715;
+String MOSIP_URL   = "";  // filled in setup() after MDNS resolution
+String REWARDS_URL = "";  // filled in setup() after MDNS resolution
 
 // Module URLs
 const char* TRASHCAN_URL  = "http://resiklo-bin.local:1145";
 const char* DISPENSER_URL = "http://resiklo-dispenser.local:1145";
 
-// Scanner Settings (GM861S)
-#define RXD2 4 
+// Pins
+#define RXD2 4
 #define TXD2 2
-// HardwareSerial qrScanner(2); // Use UART2
-// String qrData = "";
+const int greenLed    = 18;
+const int redLed      = 19;
+const int BLUE_BUTTON = 23;   // RECYCLE
+const int RED_BUTTON  = 5;    // REDEEM
+const int BUZZER_PIN  = 15;   // active buzzer (2-pin: signal + GND)
 
 // OLED Settings
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// Hardware Pins
-const int greenLed = 18;
-const int redLed = 19;
-const int BLUE_BUTTON = 23;
-const int RED_BUTTON = 5;
-
 // States
 String currentState = "IDLE";
 String currentUin   = "";
+String currentName  = "";
 
 const char* WELCOME_MSG = "ReSiklo";
 
@@ -70,13 +68,16 @@ WebServer server(80);
 // Re-entry guard
 volatile bool sessionInProgress = false;
 
+bool setupComplete = false;
+
 // HTTP Handlers
 void handleRoot() {
   String page = "<!doctype html><html><head><title>ReSiklo Identity Verification (TEST)</title></head><body>";
   page += "<h1>ReSiklo Identity Verification</h1>";
   page += "<p>State: <b>" + currentState + "</b></p>";
   page += "<p>Last UIN: " + (currentUin.length() ? currentUin : String("(none)")) + "</p>";
-  page += "<p>Backend: MOSIP @ " + String(MOSIP_URL) + " | REWARDS @ " + String(REWARDS_URL) + "</p>";
+  page += "<p>Backend: MOSIP @ " + (MOSIP_URL.length() ? MOSIP_URL : String("(unresolved)")) +
+          " | REWARDS @ " + (REWARDS_URL.length() ? REWARDS_URL : String("(unresolved)")) + "</p>";
 
   page += "<h2>Push directly to the local rewards DB</h2>";
   page += "<p>The forms below POST to this ESP32, which forwards to the rewards backend.</p>";
@@ -103,7 +104,7 @@ void handleRoot() {
 
   page += "<h2>Audit trail</h2>";
   page += "<p>RECYCLE, REDEEM, and REDEEM_DENIED events are logged in the rewards backend.</p>";
-  page += "<p><a href='" + String(REWARDS_URL) + "/audit'>View audit trail (HTML)</a></p>";
+  page += "<p><a href='/audit'>View audit trail (HTML)</a></p>";
 
   page += "<p>QR input: GM861S only (Serial2). Webcam /qr path removed.</p>";
 
@@ -134,9 +135,10 @@ void handleTestRecycle() {
   String uin    = server.hasArg("uin")    ? server.arg("uin")    : "";
   String points = server.hasArg("points") ? server.arg("points") : "10";
   String body = "uin=" + uin + "&points=" + points;
-  String resp = postRequest(String(REWARDS_URL) + "/recycle", body);
+  String url  = REWARDS_URL + "/recycle";
+  String resp = postRequest(url, body);
   server.send(200, "text/plain",
-              "POST /recycle " + body + "\n\n" + resp + "\n\nClick back to return.");
+              "POST " + url + "\nBody: " + body + "\n\n" + resp + "\n\nClick back to return.");
 }
 
 // Proxy /test/redeem -> rewards backend /redeem
@@ -144,13 +146,45 @@ void handleTestRedeem() {
   String uin    = server.hasArg("uin")    ? server.arg("uin")    : "";
   String points = server.hasArg("points") ? server.arg("points") : "50";
   String body = "uin=" + uin + "&points=" + points;
-  String resp = postRequest(String(REWARDS_URL) + "/redeem", body);
+  String url  = REWARDS_URL + "/redeem";
+  String resp = postRequest(url, body);
   server.send(200, "text/plain",
-              "POST /redeem " + body + "\n\n" + resp + "\n\nClick back to return.");
+              "POST " + url + "\nBody: " + body + "\n\n" + resp + "\n\nClick back to return.");
 }
 
-void handleNotFound() { 
-  server.send(404, "text/plain", "NOT_FOUND"); 
+// Proxy /audit -> rewards backend /audit
+void handleAudit() {
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(503, "text/plain", "OFFLINE: WiFi not connected");
+    return;
+  }
+  if (REWARDS_URL.length() == 0) {
+    server.send(502, "text/plain",
+                "BACKEND_UNRESOLVED: mDNS could not resolve " +
+                String(BACKEND_MDNS_HOST) + ".local at boot.\n"
+                "Start avahi-daemon on the backend host and reboot the ESP32.");
+    return;
+  }
+
+  String url = REWARDS_URL + "/audit";
+  if (server.hasArg("limit")) url += "?limit=" + server.arg("limit");
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(8000);
+  int code = http.GET();
+  if (code > 0) {
+    server.send(code, "text/html", http.getString());
+  } else {
+    server.send(502, "text/plain",
+                "BACKEND_UNREACHABLE: " + url + " (HTTPClient code " + String(code) + ")\n"
+                "Is rewards_backend.py running on the backend host?");
+  }
+  http.end();
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "NOT_FOUND");
 }
 
 void setup() {
@@ -161,8 +195,9 @@ void setup() {
   Serial.println("ReSiklo - Intermediary Server / Orchestrator");
 
   // Initialize scanner
+  Serial2.setRxBufferSize(2048);
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
-  Serial.println("[INIT] QR scanner UART2 ready (9600 baud)");
+  Serial.println("[INIT] QR scanner UART2 ready (9600 baud, 2 KB RX buffer)");
 
   pinMode(greenLed, OUTPUT);
   pinMode(redLed, OUTPUT);
@@ -202,34 +237,63 @@ void setup() {
     Serial.println("[WIFI] Connection FAILED (continuing for offline UI tests)");
   }
 
-  // MDNS
-  if (MDNS.begin("resiklo-backend")) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.println("[MDNS] resiklo-backend.local advertised on port 80");
-  } else {
-    Serial.println("[MDNS] FAILED to start");
-  }
-  
-  // Clear buffered data
-  while (Serial2.available() > 0) { 
-    Serial2.read(); 
-  }
-
   server.on("/",             HTTP_GET,  handleRoot);
   server.on("/state",        HTTP_GET,  handleState);
   server.on("/buttons",      HTTP_GET,  handleButtons);
+  server.on("/audit",        HTTP_GET,  handleAudit);
   server.on("/test/recycle", HTTP_POST, handleTestRecycle);
   server.on("/test/redeem",  HTTP_POST, handleTestRedeem);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("[HTTP] Server started on port 80");
+
+  // MDNS
+  if (MDNS.begin("resiklo-backend")) {
+    MDNS.setInstanceName("ReSiklo Orchestrator");
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("[MDNS] resiklo-backend.local advertised on port 80");
+
+    // Resolve the Flask backend
+    IPAddress backend = MDNS.queryHost(BACKEND_MDNS_HOST);
+    if (backend != IPAddress(0, 0, 0, 0)) {
+      MOSIP_URL   = "http://" + backend.toString() + ":" + String(MOSIP_PORT);
+      REWARDS_URL = "http://" + backend.toString() + ":" + String(REWARDS_PORT);
+      Serial.println("[MDNS] " + String(BACKEND_MDNS_HOST) + ".local -> " + backend.toString());
+      Serial.println("[MDNS]   MOSIP   " + MOSIP_URL);
+      Serial.println("[MDNS]   REWARDS " + REWARDS_URL);
+    } else {
+      Serial.println("[MDNS] WARN: could not resolve " + String(BACKEND_MDNS_HOST) + ".local");
+      Serial.println("[MDNS]   Is avahi-daemon up on the backend host? Reboot the ESP32 after starting it.");
+    }
+  } else {
+    Serial.println("[MDNS] FAILED to start");
+  }
+
+  // Drain UART noise emitted while Serial2's TX pin was being configured
+  delay(50);
+  while (Serial2.available() > 0) {
+    Serial2.read();
+  }
+
   Serial.println("[READY] System ready");
+  Serial.println("[READY] Try http://resiklo-backend.local/ or http://" + WiFi.localIP().toString() + "/");
+  setupComplete = true;
+  beep();
 }
 
 // Main Loop
 void loop() {
+  server.handleClient();
+  
   // Display idle screen
-  displayMessage(serverWelcomeMsg, "Scan your ID...");
+  if (currentState == "IDLE" && setupComplete) {
+    if (WiFi.status() == WL_CONNECTED) {
+      displayMessage(WELCOME_MSG, "Scan your ID...");
+    } else {
+      display.clearDisplay();
+      display.display();
+    }
+  }
 
   // Smoke-test: paste UIN into Serial Monitor + Enter
   if (Serial.available()) {
@@ -241,17 +305,32 @@ void loop() {
     }
   }
 
-  // Check for QR data
-  if (Serial2.available()) {
-    String qrData = Serial2.readStringUntil('\n');
-    qrData.trim();
-    if (qrData.length() >= 1) {
-      handleScannedData(qrData);
+  // Check for QR data.
+  static String qrBuffer = "";
+  while (Serial2.available()) {
+    char c = (char)Serial2.read();
+    if (c == '\r' || c == '\n') {
+      if (qrBuffer.length() > 0) {
+        // Only accept payloads that start with '{'. Anything else is a
+        // truncated tail left over from a buffer overrun while the loop
+        // was blocked, and parsing it would yield a junk UIN.
+        if (qrBuffer.indexOf('{') == 0) {
+          Serial.println("[RAW] " + qrBuffer);
+          handleScannedData(qrBuffer);
+        } else {
+          Serial.println("[DROP] partial frame: " + qrBuffer);
+        }
+        qrBuffer = "";
+      }
+    } else if (c >= 0x20 && c < 0x7F) {
+      qrBuffer += c;
+      if (qrBuffer.length() > 512) qrBuffer = "";  // runaway guard
     }
+    // else: drop non-printable byte (UART framing noise)
   }
 
   // Short delay for loop
-  delay(100); 
+  delay(50); 
 }
 
 // QR Data Intake
@@ -265,35 +344,91 @@ void handleScannedData(String raw) {
     Serial.println("[QR] No UIN found in scan");
     return;
   }
+  currentName = extractName(raw);  // optional; "" if the payload omits it
+  Serial.println("[QR] uin=" + uin + " name=" + currentName);
   handleAuthentication(uin);
+}
+
+// Extract "name" field from the QR JSON payload. Returns "" if absent.
+String extractName(String raw) {
+  int jsonStart = raw.indexOf('{');
+  if (jsonStart < 0) return "";
+  String json = raw.substring(jsonStart);
+
+  int key = json.indexOf("\"name\"");
+  if (key < 0) key = json.indexOf("\"NAME\"");
+  if (key < 0) key = json.indexOf("\"Name\"");
+  if (key < 0) return "";
+
+  int colon = json.indexOf(':', key);
+  if (colon < 0) return "";
+
+  int i = colon + 1;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+  if (i >= (int)json.length() || json[i] != '"') return "";
+
+  int q2 = json.indexOf('"', i + 1);
+  if (q2 < 0) return "";
+  return json.substring(i + 1, q2);
 }
 
 // Extract "uin"
 String extractUin(String raw) {
-  int key = raw.indexOf("\"uin\"");
-  if (key < 0) {
-    String trimmed = raw;
-    trimmed.trim();
-    return trimmed;
+  // 1) Skip any non-JSON prefix by finding the start of the object
+  int jsonStart = raw.indexOf('{');
+  if (jsonStart < 0) {
+    // Strip non-digits
+    String digits = "";
+    for (unsigned int i = 0; i < raw.length(); i++) {
+      char c = raw[i];
+      if (c >= '0' && c <= '9') digits += c;
+    }
+    return digits;
   }
-  int colon = raw.indexOf(':', key);
+  String json = raw.substring(jsonStart);
+
+  // 2) Find the "uin" key
+  int key = json.indexOf("\"uin\"");
+  if (key < 0) key = json.indexOf("\"UIN\"");
+  if (key < 0) key = json.indexOf("\"Uin\"");
+  if (key < 0) return "";
+
+  // 3) Find the colon after the key
+  int colon = json.indexOf(':', key);
   if (colon < 0) return "";
-  int q1 = raw.indexOf('"', colon + 1);
-  if (q1 < 0) return "";
-  int q2 = raw.indexOf('"', q1 + 1);
-  if (q2 < 0) return "";
-  return raw.substring(q1 + 1, q2);
+
+  // 4) Skip whitespace after the colon
+  int i = colon + 1;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+  if (i >= (int)json.length()) return "";
+
+  // 5) Read the value -- "string" or unquoted number
+  if (json[i] == '"') {
+    int q2 = json.indexOf('"', i + 1);
+    if (q2 < 0) return "";
+    return json.substring(i + 1, q2);
+  } else {
+    int j = i;
+    while (j < (int)json.length()) {
+      char c = json[j];
+      if (c == ',' || c == '}' || c == ' ' || c == '\r' || c == '\n' || c == '\t') break;
+      j++;
+    }
+    return json.substring(i, j);
+  }
 }
 
 // PHASE 1: USER AUTHENTICATION
-void handleAuthentication(String data) {
+void handleAuthentication(String uin) {
   sessionInProgress = true;
   currentUin = uin;
   currentState = "VERIFYING";
-  displayMessage("Verifying user...", "Please wait...");
+  // Show the scanned identity on the OLED so the user can confirm we
+  // read the right ID before authentication completes.
+  String nameLine = currentName.length() ? currentName : String("(unknown name)");
+  displayMessage(nameLine, "UIN: " + uin);
   Serial.println("Verifying ID: " + uin);
-  displayMessage("Verifying user...", "Please wait..."); 
-  Serial.println("Verifying ID: " + data);
+  delay(3000);
   
   String response = postRequest(String(MOSIP_URL) + "/authenticate", "id=" + uin);
   response.trim();
@@ -313,6 +448,7 @@ void handleAuthentication(String data) {
 
     unsigned long startTime = millis();
     unsigned long blueLowSince = 0, redLowSince = 0;
+    unsigned long lastDbg = 0;
     bool selectionMade = false;
 
     // Wait up to timeout for a button press
@@ -321,6 +457,14 @@ void handleAuthentication(String data) {
 
       int blueState = digitalRead(BLUE_BUTTON);
       int redState  = digitalRead(RED_BUTTON);
+
+      // Periodic Serial diagnostic so we can confirm what the buttons read
+      // during the wait without flooding the log.
+      if (millis() - lastDbg > 500) {
+        lastDbg = millis();
+        Serial.printf("[SELECT] t=%lums BLUE=%d RED=%d\n",
+                      millis() - startTime, blueState, redState);
+      }
 
       if (blueState == LOW) {
         if (blueLowSince == 0) blueLowSince = millis();
@@ -371,13 +515,17 @@ void handleAuthentication(String data) {
     digitalWrite(redLed, LOW);
   }
 
+  // Drain the UART RX buffer so we don't immediately re-trigger
+  // on stale repeats the moment we return to the main loop
+  while (Serial2.available()) Serial2.read();
+
   currentState = "IDLE";
   currentUin = "";
+  currentName = "";
   sessionInProgress = false;
 }
 
 // Sends HTTP POST to let another module start now
-// For testing
 void dispatchTrigger(const char* baseUrl) {
   Serial.printf("[DISPATCH] POST %s/trigger\n", baseUrl);
   if (WiFi.status() != WL_CONNECTED) {
@@ -418,9 +566,9 @@ void smartDelay(unsigned long ms) {
 // Helpers
 // bee bee beeeeeeeeeep
 void beep() {
-  digitalWrite(BUZZER_PIN, HIGH);
+  tone(BUZZER_PIN, 1000);
   delay(BEEP_MS);
-  digitalWrite(BUZZER_PIN, LOW);
+  noTone(BUZZER_PIN);
 }
 
 // Helper for displaying messages
@@ -434,31 +582,31 @@ void displayMessage(String line1, String line2) {
   display.display();
 }
 
-// Helper for POST message to intermediary server
-String postRequest(String endpoint, String postData) {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    
-    // URL now points to /authenticate
-    http.begin(String(serverUrl) + endpoint);
- 
-    // Set timeout to 35 seconds
-    // 5 sec longer than flask_app.py
-    http.setTimeout(35000);
-    
-    // Set the content type for form data
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
-    // Send the POST request with the data in the body
-    int httpResponseCode = http.POST(postData);
-
-    if (httpResponseCode > 0) {
-      String payload = http.getString();
-      http.end();
-      // Returns "VALID" or "INVALID"
-      return payload;
-    }
-    http.end();
+// Helper for POST message to intermediary server.
+// On success returns the backend's response body
+// On failure returns "ERROR_*: <reason>" so the dashboard can show the cause
+String postRequest(String url, String postData) {
+  if (url.length() == 0 || !url.startsWith("http")) {
+    Serial.println("[POST] aborted: backend URL not resolved");
+    return "ERROR_NO_URL: backend mDNS unresolved (reboot ESP32 after avahi is up)";
   }
-  return "ERROR";
+  if (WiFi.status() != WL_CONNECTED) {
+    return "ERROR_NO_WIFI";
+  }
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(10000);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int httpResponseCode = http.POST(postData);
+
+  if (httpResponseCode > 0) {
+    String payload = http.getString();
+    Serial.printf("[POST %s] %d -> %s\n", url.c_str(), httpResponseCode, payload.c_str());
+    http.end();
+    return payload;
+  }
+  Serial.printf("[POST %s] failed code=%d\n", url.c_str(), httpResponseCode);
+  http.end();
+  return "ERROR_HTTP " + String(httpResponseCode) + " (is the Flask backend listening on " + url + "?)";
 }
